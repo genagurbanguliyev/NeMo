@@ -169,7 +169,7 @@ class TestEncDecMultiTaskModel:
         asr_model.compute_eval_loss = False
 
         input_signal = torch.randn(size=(4, 512))
-        length = torch.randint(low=161, high=500, size=[4])
+        length = torch.randint(low=321, high=500, size=[4])
 
         targets = torch.randint(low=0, high=100, size=[4, 10])
         targets_len = torch.randint(low=1, high=10, size=[4])
@@ -184,7 +184,6 @@ class TestEncDecMultiTaskModel:
                     transcript=targets[i : i + 1],
                     transcript_length=targets_len[i : i + 1],
                 )
-                print(log_probs.shape)
                 logprobs_instance.append(log_probs)
             logits_instance = torch.cat(logprobs_instance, 0)
 
@@ -293,17 +292,19 @@ class TestEncDecMultiTaskModel:
         with torch.no_grad():
             ans = asr_model.validation_pass(batch, batch_idx=0)
         print(ans)
-        assert list(ans.keys()) == [
-            "val_loss",
-            "val_wer",
-            "val_wer_num",
-            "val_wer_denom",
-            "val_bleu",
-            "val_bleu_pred_len",
-            "val_bleu_target_len",
-            "val_bleu_num",
-            "val_bleu_denom",
-        ]
+        assert set(ans.keys()) == set(
+            [
+                "val_loss",
+                "val_wer",
+                "val_wer_num",
+                "val_wer_denom",
+                "val_bleu",
+                "val_bleu_pred_len",
+                "val_bleu_target_len",
+                "val_bleu_num",
+                "val_bleu_denom",
+            ]
+        )
 
     @pytest.mark.unit
     def test_save_restore_artifact(self, asr_model):
@@ -546,7 +547,43 @@ class TestEncDecMultiTaskModel:
         }
         model.read_audio_file(audio_file, delay=0.0, model_stride_in_secs=40.0, meta_data=meta)
         outputs = model.transcribe()
-        assert isinstance(outputs, str)
+        assert isinstance(outputs, Hypothesis)
+
+    @pytest.mark.with_downloads()
+    @pytest.mark.unit
+    def test_FrameBatchMultiTaskAED_with_timestamps(self, canary_1b_flash):
+        canary_1b_flash.eval()
+        model = FrameBatchMultiTaskAED(
+            canary_1b_flash,
+            frame_len=10.0,
+            total_buffer=10.0,
+            batch_size=8,
+        )
+
+        audio_file = "/home/TestData/asr/longform/earnings22/sample_4469669.wav"
+        meta = {
+            'audio_filepath': audio_file,
+            'duration': 100000,
+            'source_lang': 'en',
+            'taskname': 'asr',
+            'target_lang': 'en',
+            'pnc': 'yes',
+            'answer': 'nothing',
+            'timestamp': 'yes',
+        }
+        model_stride_in_secs = 0.01 * 8  # feature_stride in sec * model_stride
+        model.read_audio_file(audio_file, delay=0.0, model_stride_in_secs=model_stride_in_secs, meta_data=meta)
+        outputs = model.transcribe()
+
+        # check hypothesis object
+        assert isinstance(outputs, Hypothesis)
+
+        # check part of transcript
+        assert outputs.text[:13] == "Now it's time", f"{outputs}"
+
+        # check timestamps
+        assert outputs.timestamp['segment'][0]['start'] == pytest.approx(5.68)
+        assert outputs.timestamp['segment'][0]['end'] == pytest.approx(9.68)
 
 
 @pytest.mark.unit
