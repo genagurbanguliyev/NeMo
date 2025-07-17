@@ -34,10 +34,7 @@ from ..utils import (
 )
 
 HF_MODEL_URI = "deepseek-ai/DeepSeek-V3-Base"
-
-
-# Use token drop callback
-USE_TOKEN_DROP = True
+USE_TOKEN_DROP = True  # Use token drop callback
 
 
 def override_recipe_configs(
@@ -50,6 +47,8 @@ def override_recipe_configs(
     cp_size: int,
     vp_size: int,
     ep_size: int,
+    num_layers: int,
+    hidden_size: int,
     etp_size: int,
     enable_cuda_graphs: bool,
     use_mcore_fsdp: bool,
@@ -60,7 +59,7 @@ def override_recipe_configs(
     """
     DeepSeek V3 pre-train recipe aimed at achieving best possible performance.
     """
-    recipe = pretrain_recipe()
+    recipe = pretrain_recipe(performance_mode=True)
     recipe.model.config.moe_permute_fusion = True
     recipe.model.config.recompute_granularity = "selective"
     recipe.model.config.recompute_num_layers = None
@@ -74,20 +73,10 @@ def override_recipe_configs(
     recipe.trainer.strategy.num_layers_in_first_pipeline_stage = num_layers_in_middle_pipeline_stages - 1
     recipe.trainer.strategy.num_layers_in_last_pipeline_stage = num_layers_in_middle_pipeline_stages - 2
 
-    callbacks = []
+    if not hasattr(recipe.trainer, "callbacks") or recipe.trainer.callbacks is None:
+        recipe.trainer.callbacks = []
     if USE_TOKEN_DROP:
-        callbacks.append(run.Config(MegatronTokenDropCallback))
-    garbage_collection_callback = run.Config(
-        GarbageCollectionCallback,
-        gc_interval_train=60,
-        gc_interval_val=60,
-    )
-    comm_overlap_callback = run.Config(
-        MegatronCommOverlapCallback,
-        tp_comm_overlap=False,
-    )
-    callbacks.extend([garbage_collection_callback, comm_overlap_callback])
-    recipe.trainer.callbacks.extend(callbacks)
+        recipe.trainer.callbacks.append(run.Config(MegatronTokenDropCallback))
 
     recipe = set_primary_perf_configs(
         recipe,
@@ -102,6 +91,8 @@ def override_recipe_configs(
         cp_size,
         vp_size,
         ep_size,
+        num_layers,
+        hidden_size,
         etp_size,
         enable_cuda_graphs=enable_cuda_graphs,
         use_mcore_fsdp=use_mcore_fsdp,
@@ -147,6 +138,8 @@ if __name__ == "__main__":
         cp_size,
         vp_size,
         ep_size,
+        num_layers,
+        hidden_size,
         etp_size,
         enable_cuda_graphs,
         use_mcore_fsdp,
@@ -154,7 +147,6 @@ if __name__ == "__main__":
         activation_offload_layers,
         recompute_modules,
     ) = kwargs
-
     recipe = override_recipe_configs(
         args,
         num_nodes,
@@ -165,6 +157,8 @@ if __name__ == "__main__":
         cp_size,
         vp_size,
         ep_size,
+        num_layers,
+        hidden_size,
         etp_size,
         enable_cuda_graphs,
         use_mcore_fsdp,
@@ -173,8 +167,37 @@ if __name__ == "__main__":
         recompute_modules,
     )
 
-    exp_config = f"{num_nodes}nodes_tp{tp_size}_pp{pp_size}_cp{cp_size}_vp{vp_size}_ep{ep_size}_{mbs}mbs_{gbs}gbs"
+    exp_config = f"gpus{args.num_gpus}_tp{tp_size}_pp{pp_size}_cp{cp_size}_vp{vp_size}_ep{ep_size}_mbs{mbs}_gbs{gbs}"
     exp_name = f"{splitext(basename(__file__))[0]}_{args.compute_dtype}_{exp_config}"
+
+    plugins = [
+        PerfEnvPlugin(
+            enable_vboost=True,
+            nccl_pp_comm_chunksize=2097152 if pp_size > 1 else None,
+            gpu_sm100_or_newer=(args.gpu.lower() in ['b200', 'gb200']),
+        )
+    ]
+    custom_env_vars = {}
+
+    if args.gpu.lower() == 'gb200':
+        custom_env_vars |= {"NCCL_NET_GDR_LEVEL": "PHB"}
+
+    if args.enable_nsys:
+        plugins.append(
+            NsysPlugin(
+                start_step=args.profiling_start_step,
+                end_step=args.profiling_stop_step,
+                ranks=list(range(num_nodes * args.gpus_per_node)),
+                nsys_gpu_metrics=args.profiling_gpu_metrics,
+            )
+        )
+        # nsys takes precedent over ncclttrace
+    elif args.enable_nccltrace:
+        exp_name = exp_name + "_nccltrace"
+        custom_env_vars |= {
+            "NCCL_DEBUG_SUBSYS": "COLL,P2P,NET",
+            "NCCL_DEBUG": "INFO",
+        }
 
     executor = slurm_executor(
         args.account,
@@ -185,21 +208,11 @@ if __name__ == "__main__":
         args.time_limit,
         args.container_image,
         custom_mounts=args.custom_mounts,
-        custom_env_vars={},
+        custom_env_vars=custom_env_vars,
         hf_token=args.hf_token,
         nemo_home=args.nemo_home,
         wandb_key=args.wandb_key,
     )
-
-    plugins = [
-        PerfEnvPlugin(
-            enable_vboost=True,
-            nccl_pp_comm_chunksize=2097152 if pp_size > 1 else None,
-            gpu_sm100_or_newer=(args.gpu.lower() in ['b200', 'gb200']),
-        )
-    ]
-    if args.enable_nsys:
-        plugins.append(NsysPlugin(start_step=5, end_step=6))
 
     with run.Experiment(exp_name) as exp:
         exp.add(

@@ -14,25 +14,16 @@
 
 from os.path import basename, splitext
 
-import fiddle as fdl
-import fiddle._src.experimental.dataclasses as fdl_dc
 import nemo_run as run
 
-from nemo.collections.llm.recipes.llama31_405b import pretrain_recipe
-from nemo.collections.llm.recipes.tp_overlap_configs.userbuffers import (
-    userbuffers_bf16_b200_h16384_tp4_cp2_mbs1_seqlen8192,
-    userbuffers_bf16_h100_h16384_tp8_cp2_mbs1_seqlen8192,
-    userbuffers_fp8_b200_h16384_tp4_cp2_mbs1_seqlen8192,
-    userbuffers_fp8_h100_h16384_tp8_cp2_mbs1_seqlen8192,
-)
+from nemo.collections.llm.recipes.nemotronh_56b import pretrain_recipe
+from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
 from nemo.lightning.run.plugins import NsysPlugin, PerfEnvPlugin
 
 from ..argument_parser import parse_cli_args
 from ..utils import (
     args_sanity_check,
-    get_comm_overlap_callback_idx,
     get_user_configs,
-    hf_tokenizer,
     set_exp_logging_configs,
     set_primary_perf_configs,
     slurm_executor,
@@ -51,14 +42,10 @@ def override_recipe_configs(
     ep_size: int,
     num_layers: int,
     hidden_size: int,
-    etp_size: int = None,
-    enable_cuda_graphs: bool = False,
-    use_mcore_fsdp: bool = False,
-    recompute_layers: int = 0,
-    activation_offload_layers: int = 0,
+    enable_cuda_graphs: bool,
 ):
     """
-    llama3 405b pre-train recipe aimed at achieving best possible performance.
+    nemotronh 56b pre-train recipe aimed at achieving best possible performance.
 
     NOTE: Use fp8 precision training with caution. It might not give desirable results.
     """
@@ -78,60 +65,22 @@ def override_recipe_configs(
         ep_size,
         num_layers,
         hidden_size,
-        etp_size,
         enable_cuda_graphs=enable_cuda_graphs,
-        use_mcore_fsdp=use_mcore_fsdp,
-        recompute_layers=recompute_layers,
-        activation_offload_layers=activation_offload_layers,
         compute_dtype=args.compute_dtype,
         fp8_recipe=args.fp8_recipe,
     )
     recipe = set_exp_logging_configs(
-        recipe, "pre_train", "llm", "llama3", args.tensorboard, args.wandb, args.wandb_prj_name, args.wandb_job_name
+        recipe, "pre_train", "llm", "nemotronh", args.tensorboard, args.wandb, args.wandb_prj_name, args.wandb_job_name
     )
 
     gpu_type = args.gpu.lower()
 
     # data module configs
-    recipe.data.tokenizer = hf_tokenizer("meta-llama/Llama-3.1-405B")
+    recipe.data.tokenizer = run.Config(
+        get_nmt_tokenizer, library="null", model_name="NullTokenizer", vocab_size=131072
+    )
 
-    userbuffers_bf16_h100_h16384_tp8_cp2_mbs1_seqlen8192.qkv_fprop.aggregate = False
-    userbuffers_bf16_h100_h16384_tp8_cp2_mbs1_seqlen8192.proj_dgrad.aggregate = False
-    userbuffers_bf16_h100_h16384_tp8_cp2_mbs1_seqlen8192.fc1_fprop.aggregate = False
-    userbuffers_bf16_h100_h16384_tp8_cp2_mbs1_seqlen8192.fc2_dgrad.aggregate = False
-
-    userbuffers_fp8_h100_h16384_tp8_cp2_mbs1_seqlen8192.qkv_fprop.aggregate = False
-    userbuffers_fp8_h100_h16384_tp8_cp2_mbs1_seqlen8192.proj_dgrad.aggregate = False
-    userbuffers_fp8_h100_h16384_tp8_cp2_mbs1_seqlen8192.fc1_fprop.aggregate = False
-    userbuffers_fp8_h100_h16384_tp8_cp2_mbs1_seqlen8192.fc2_dgrad.aggregate = False
-
-    ub_cfg = {
-        "h100": {
-            "bf16": userbuffers_bf16_h100_h16384_tp8_cp2_mbs1_seqlen8192,
-            "fp8": userbuffers_fp8_h100_h16384_tp8_cp2_mbs1_seqlen8192,
-        },
-        "b200": {
-            "bf16": userbuffers_bf16_b200_h16384_tp4_cp2_mbs1_seqlen8192,
-            "fp8": userbuffers_fp8_b200_h16384_tp4_cp2_mbs1_seqlen8192,
-        },
-        "gb200": {
-            "bf16": userbuffers_bf16_b200_h16384_tp4_cp2_mbs1_seqlen8192,
-            "fp8": userbuffers_fp8_b200_h16384_tp4_cp2_mbs1_seqlen8192,
-        },
-    }
-
-    comm_overlap_callback_idx = get_comm_overlap_callback_idx(recipe.trainer.callbacks)
-    assert comm_overlap_callback_idx is not None, "MegatronCommOverlapCallback missing. Required for performance."
-
-    if args.fp8_recipe.lower() != "mxfp8":
-        tp_comm_overlap_cfg = ub_cfg[gpu_type][args.compute_dtype]
-        # needed as tp_overlap_configs.userbuffers are dataclass objects which are unserializable
-        tp_comm_overlap_cfg = fdl.cast(run.Config, fdl_dc.convert_dataclasses_to_configs(tp_comm_overlap_cfg))
-        recipe.trainer.callbacks[comm_overlap_callback_idx].tp_comm_overlap_cfg = tp_comm_overlap_cfg
-    if args.compute_dtype.lower() == "fp8" and args.fp8_recipe.lower() == "mxfp8":
-        recipe.trainer.callbacks[comm_overlap_callback_idx].tp_comm_overlap_cfg = None
-        recipe.trainer.callbacks[comm_overlap_callback_idx].tp_comm_overlap = False
-
+    recipe.model.config.attention_backend = "auto"
     return recipe
 
 
@@ -139,7 +88,7 @@ if __name__ == "__main__":
     args = parse_cli_args().parse_args()
     args_sanity_check(args)
 
-    kwargs = get_user_configs(args.gpu.lower(), "pre_train", "llama31", "405b", args)
+    kwargs = get_user_configs(args.gpu.lower(), "pre_train", "nemotronh", "56b", args)
     (
         num_nodes,
         mbs,
@@ -151,12 +100,9 @@ if __name__ == "__main__":
         ep_size,
         num_layers,
         hidden_size,
-        etp_size,
+        _,
         enable_cuda_graphs,
-        use_mcore_fsdp,
-        recompute_layers,
-        activation_offload_layers,
-    ) = kwargs[:15]
+    ) = kwargs[:12]
 
     recipe = override_recipe_configs(
         args,
@@ -170,24 +116,11 @@ if __name__ == "__main__":
         ep_size,
         num_layers,
         hidden_size,
-        etp_size,
         enable_cuda_graphs,
-        use_mcore_fsdp,
-        recompute_layers,
-        activation_offload_layers,
     )
 
     exp_config = f"gpus{args.num_gpus}_tp{tp_size}_pp{pp_size}_cp{cp_size}_vp{vp_size}_mbs{mbs}_gbs{gbs}"
     exp_name = f"{splitext(basename(__file__))[0]}_{args.compute_dtype}_{exp_config}"
-
-    env_vars = {
-        "NVTE_NORM_FWD_USE_CUDNN": "1",
-        "NVTE_NORM_BWD_USE_CUDNN": "1",
-        "TRANSFORMERS_OFFLINE": "0",
-    }
-
-    if args.gpu.lower() == 'gb200':
-        env_vars |= {"NCCL_NET_GDR_LEVEL": "PHB"}
 
     plugins = [
         PerfEnvPlugin(
@@ -196,6 +129,12 @@ if __name__ == "__main__":
             gpu_sm100_or_newer=(args.gpu.lower() in ['b200', 'gb200']),
         )
     ]
+
+    custom_env_vars = {"TRANSFORMERS_OFFLINE": "0"}
+
+    if args.gpu.lower() == 'gb200':
+        custom_env_vars |= {"NCCL_NET_GDR_LEVEL": "PHB"}
+
     if args.enable_nsys:
         plugins.append(
             NsysPlugin(
@@ -205,10 +144,9 @@ if __name__ == "__main__":
                 nsys_gpu_metrics=args.profiling_gpu_metrics,
             )
         )
-        # nsys takes precedent over ncclttrace
-    elif args.enable_nccltrace:
+    elif args.enable_nccltrace:  # nsys takes precedent over nccltrace
         exp_name = exp_name + "_nccltrace"
-        env_vars |= {
+        custom_env_vars |= {
             "NCCL_DEBUG_SUBSYS": "COLL,P2P,NET",
             "NCCL_DEBUG": "INFO",
         }
@@ -222,7 +160,7 @@ if __name__ == "__main__":
         args.time_limit,
         args.container_image,
         custom_mounts=args.custom_mounts,
-        custom_env_vars=env_vars,
+        custom_env_vars=custom_env_vars,
         hf_token=args.hf_token,
         nemo_home=args.nemo_home,
         wandb_key=args.wandb_key,

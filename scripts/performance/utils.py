@@ -23,6 +23,7 @@ from lightning.pytorch.callbacks.callback import Callback
 from nemo_run.config import get_nemorun_home
 from numpy import nan
 
+import nemo.lightning as nl
 from nemo.collections.common.tokenizers.huggingface import AutoTokenizer
 from nemo.collections.llm.gpt.data.mock import MockDataModule
 from nemo.collections.llm.gpt.data.squad import SquadDataModule
@@ -33,6 +34,7 @@ from nemo.collections.llm.recipes.precision.mixed_precision import (
     bf16_with_fp8_mixed,
     bf16_with_mxfp8_mixed,
 )
+from nemo.lightning import AutoResume
 from nemo.lightning.base import DEFAULT_NEMO_CACHE_HOME
 from nemo.lightning.pytorch.callbacks.flops_callback import FLOPsMeasurementCallback
 from nemo.utils import logging
@@ -79,20 +81,35 @@ def slurm_executor(
     if wandb_key is not None:
         env_vars["WANDB_API_KEY"] = wandb_key
     mounts = []
+    numa_bind_factor = max(1, int(num_gpus_per_node / 2))  # Ensure at least 1 to avoid division by zero
     srun_args = [
         "--mpi=pmix",
-        "numactl --cpunodebind=$((SLURM_LOCALID/4)) --membind=$((SLURM_LOCALID/4))",
     ]
 
     if nemo_home != DEFAULT_NEMO_CACHE_HOME:  # DO NOT change this to 'DEFAULT_NEMO_HOME'/'NEMO_HOME'
         env_vars.update({"NEMO_HOME": nemo_home})
         mounts.extend([f"{nemo_home}:{nemo_home}"])
+
+    # Extra location mount for checkpointing support
+    NEMORUN_HOME = os.getenv('NEMORUN_HOME')
+    mounts.extend([f"{NEMORUN_HOME}:{NEMORUN_HOME}"])
     if hf_token is not None:
         env_vars.update({"HF_TOKEN": hf_token, "TRANSFORMERS_OFFLINE": "0"})
 
     env_vars |= custom_env_vars
+
+    # add all environment variables to container environment
+    container_env_args = ["--container-env=" + ",".join(list(env_vars.keys()))]
+    srun_args.extend(container_env_args)
+
     mounts.extend(custom_mounts)
     srun_args.extend(custom_srun_args)
+
+    # apply numactl args at very end of srun args
+    numactl_args = [
+        f"numactl --cpunodebind=$((SLURM_LOCALID/{numa_bind_factor})) --membind=$((SLURM_LOCALID/{numa_bind_factor}))",
+    ]
+    srun_args.extend(numactl_args)
 
     # add --segment flag to sbatch if job uses GB200 and goes beyond one rack.
     segment = None
@@ -117,8 +134,61 @@ def slurm_executor(
         time=time_limit,
         mem="0",
         exclusive=True,
-        packager=run.GitArchivePackager(),
+        packager=run.Packager(),
         segment=segment,
+    )
+
+    return executor
+
+
+def runai_executor(
+    base_url: str,
+    app_id: str,
+    app_secret: str,
+    project_name: str,
+    pvc_nemo_run_dir: str,
+    nodes: int,
+    num_gpus_per_node: int,
+    launched_from_cluster: bool = False,
+    container_image: str = "nvcr.io/nvidia/nemo:dev",
+    custom_mounts: List[dict[str, any]] = [],
+    custom_env_vars: Dict[str, str] = {},
+    hf_token: str = None,
+    wandb_key: str = None,
+) -> run.DGXCloudExecutor:
+    """
+    DGXC Create cluster definition with appropriate cluster params and NeMo container params needed for pre-training
+    and fine-tuning experiments
+    """
+    env_vars = {
+        "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",  # Disable caching NCCL communication buffer memory
+        "TRANSFORMERS_OFFLINE": "1",  # Enable online downloads from HuggingFace
+        "TOKENIZERS_PARALLELISM": "False",  # Restrict warning message prints
+        "NCCL_NVLS_ENABLE": "0",  # Disable NVLink SHARP to save memory
+        "NVTE_FLASH_ATTN": "1",  # Enable Flash Attention, which is needed to enable cuDNN fused attention
+        "NVTE_FUSED_ATTN": "1",  # Enable cuDNN fused attention
+        "NEMO_LOG_MEMORY_USAGE": "1",  # Print memory allocation
+    }
+
+    if wandb_key is not None:
+        env_vars["WANDB_API_KEY"] = wandb_key
+    if hf_token is not None:
+        env_vars.update({"HF_TOKEN": hf_token, "TRANSFORMERS_OFFLINE": "0"})
+    env_vars |= custom_env_vars
+
+    executor = run.DGXCloudExecutor(
+        base_url=base_url,
+        app_id=app_id,
+        app_secret=app_secret,
+        project_name=project_name,
+        nodes=nodes,
+        gpus_per_node=num_gpus_per_node,
+        container_image=container_image,
+        pvc_nemo_run_dir=pvc_nemo_run_dir,
+        env_vars=env_vars,
+        launcher="torchrun",  # Use torchrun to launch the processes
+        launched_from_cluster=launched_from_cluster,
+        pvcs=custom_mounts,
     )
 
     return executor
@@ -199,6 +269,9 @@ def get_user_configs(gpu: str, task: str, model_name: str, model_size: str, args
     enable_cuda_graphs = config.get("cuda_graphs") if args.cuda_graphs is None else args.cuda_graphs
     enable_cuda_graphs = False if enable_cuda_graphs is None else bool(int(enable_cuda_graphs))
 
+    num_layers = args.num_layers
+    hidden_size = args.hidden_size
+
     use_mcore_fsdp = config.get("use_mcore_fsdp") if args.use_mcore_fsdp is None else args.use_mcore_fsdp
     use_mcore_fsdp = False if use_mcore_fsdp is None else bool(int(use_mcore_fsdp))
 
@@ -219,7 +292,7 @@ def get_user_configs(gpu: str, task: str, model_name: str, model_size: str, args
     else:
         recompute_modules = None
 
-    kwargs = num_nodes, mbs, gbs, tp_size, pp_size, cp_size, vp_size, ep_size, etp_size
+    kwargs = num_nodes, mbs, gbs, tp_size, pp_size, cp_size, vp_size, ep_size, num_layers, hidden_size, etp_size
     kwargs = [int(arg) if arg is not None else arg for arg in kwargs] + [
         enable_cuda_graphs,
         use_mcore_fsdp,
@@ -244,6 +317,8 @@ def set_primary_perf_configs(
     cp_size: int,
     vp_size: int,
     ep_size: int,
+    num_layers: Optional[int] = None,
+    hidden_size: Optional[int] = None,
     etp_size: Optional[int] = None,
     enable_cuda_graphs: bool = False,
     use_mcore_fsdp: bool = False,
@@ -252,6 +327,8 @@ def set_primary_perf_configs(
     compute_dtype: str = None,
     fp8_recipe: str = None,
     recompute_modules: Optional[List[str]] = None,
+    save_checkpoint: Optional[bool] = False,
+    load_checkpoint_path: Optional[str] = None,
 ):
     """Set experiment configs we usually tune for performance of all models."""
 
@@ -298,6 +375,12 @@ def set_primary_perf_configs(
     recipe.trainer.strategy.expert_tensor_parallel_size = etp_size
 
     recipe.trainer.strategy.sequence_parallel = bool(tp_size > 1)
+
+    # other parameters to make them explicit in yaml configs
+    if num_layers:
+        recipe.model.config.num_layers = num_layers
+    if hidden_size:
+        recipe.model.config.hidden_size = hidden_size
 
     # callback configs
     comm_overlap_callback_idx = get_comm_overlap_callback_idx(recipe.trainer.callbacks)
@@ -384,6 +467,26 @@ def set_primary_perf_configs(
             recipe.model.config.recompute_num_layers is None
         ), "recompute_num_layers must be None when recompute_modules is provided"
 
+    recipe.trainer.enable_checkpointing = save_checkpoint
+    recipe.trainer.val_check_interval = max_steps
+
+    if recipe.trainer.enable_checkpointing or load_checkpoint_path is not None:
+        recipe.trainer.callbacks[comm_overlap_callback_idx].overlap_param_gather_with_optimizer_step = False
+
+    if load_checkpoint_path is not None:
+        recipe.resume = run.Config(
+            AutoResume,
+            resume_if_exists=True,
+            resume_ignore_no_checkpoint=False,
+            restore_config=run.Config(
+                nl.RestoreConfig,
+                path=load_checkpoint_path,
+                load_model_state=True,
+                load_optim_state=True,
+                load_artifacts=False,
+            ),
+        )
+
     return recipe
 
 
@@ -398,7 +501,7 @@ def set_exp_logging_configs(
     wandb_job_name: str,
 ):
     """Set experiment logging configs."""
-    if task == "pre_train" and domain == "llm":
+    if (task == "pre_train" or task == "none") and domain == "llm":
         recipe.trainer.callbacks.append(
             run.Config(
                 FLOPsMeasurementCallback,
@@ -421,7 +524,6 @@ def set_exp_logging_configs(
 
     # Misc. for overall faster experiment runtime
     recipe.log.ckpt = None
-    recipe.trainer.enable_checkpointing = False
     recipe.trainer.log_every_n_steps = 1
 
     return recipe
@@ -445,6 +547,100 @@ def import_ckpt_experiment(executor: run.SlurmExecutor, model: run.Config[GPTMod
     import_executor.nodes = 1
 
     return run.Partial(import_ckpt, model=model, source=source, overwrite=False), import_executor, "import_ckpt_exp"
+
+
+def get_nemo_home(nemo_home=None):
+    """
+    Get NEMO_HOME path. Checks for both nemo_home argument and NEMO_HOME environment variable.
+    """
+    arg_nemo_set = nemo_home is True
+    env_nemo_set = "NEMO_HOME" in os.environ
+
+    if arg_nemo_set and env_nemo_set:
+        if os.environ["NEMO_HOME"] != nemo_home:
+            logging.warning(f"Using nemo_home ({nemo_home}) instead of NEMO_HOME ({os.environ['NEMO_HOME']})")
+        return nemo_home
+
+    if arg_nemo_set:
+        return nemo_home
+
+    if env_nemo_set:
+        return os.environ["NEMO_HOME"]
+
+    raise ValueError("Neither nemo_home argument nor NEMO_HOME environment variable is set")
+
+
+def prepare_squad_dataset(model_name: str, seq_length: int = 2048, nemo_home=None):
+    """Prepare the SQuAD dataset for fine-tuning.
+
+    Args:
+        model_name (str): The name of the model
+        seq_length (int): The sequence length to use for packing. Defaults to 2048.
+        nemo_home: Optional path to NEMO home directory set via args.nemo_home
+        use_hf_tokenizer: Whether to use HuggingFace tokenizer or NullTokenizer
+        vocab_size: Vocabulary size to use when use_hf_tokenizer is False. Required when use_hf_tokenizer is False.
+    """
+    from pathlib import Path
+
+    from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
+    from nemo.collections.llm.gpt.data.packed_sequence import PackedSequenceSpecs
+    from nemo.collections.llm.gpt.data.squad import SquadDataModule
+
+    nemo_home_path = Path(get_nemo_home(nemo_home))
+    dataset_root = nemo_home_path / "datasets" / "squad"
+    dataset_root.mkdir(parents=True, exist_ok=True)
+
+    tokenizer = AutoTokenizer(pretrained_model_name=model_name)
+    # Configure SquadDataModule with packing specs
+    datamodule = SquadDataModule(
+        dataset_root=dataset_root,
+        seq_length=seq_length,
+        global_batch_size=8,
+        micro_batch_size=1,
+        packed_sequence_specs=PackedSequenceSpecs(packed_sequence_size=seq_length),
+        tokenizer=tokenizer,
+        force_redownload=True,
+        delete_raw=False,
+        seed=1234,
+    )
+
+    # This will generate both JSONL and packed .bin files
+    datamodule.prepare_data()
+
+    # Verify the output
+    packed_dir = dataset_root / "packed" / model_name.replace("/", "--")
+    print(f"Packed files should be in: {packed_dir}")
+    if packed_dir.exists():
+        print("Files found:", list(packed_dir.glob("*")))
+    else:
+        raise FileNotFoundError(f"Packed dataset dir not found at {packed_dir}. Dataset download failed")
+
+
+def prepare_squad_dataset_experiment(
+    executor: run.SlurmExecutor,
+    model_name: str,
+    seq_length: int = 2048,
+    nemo_home=None,
+):
+    """
+    Downloads and prepares the SQuAD dataset for fine-tuning.
+    """
+    from copy import deepcopy
+
+    dataset_executor = deepcopy(executor)
+    dataset_executor.ntasks_per_node = 1
+    dataset_executor.nodes = 1
+
+    return (
+        run.Partial(
+            prepare_squad_dataset,
+            model_name=model_name,
+            seq_length=seq_length,
+            nemo_home=nemo_home,
+        ),
+        dataset_executor,
+        "prepare_squad_dataset_exp",
+    )
 
 
 def isfile_train_pack_metadata(hf_model_uri: str, data_config: run.Config[SquadDataModule]) -> bool:
